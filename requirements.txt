@@ -1,2 +1,7 @@
 streamlit
-pandas
+feedparser
+google-genai
+nba_api
+pydantic
+python-dotenv
+torch
