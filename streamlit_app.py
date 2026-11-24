@@ -1,151 +1,149 @@
-import streamlit as st
-import pandas as pd
-import math
-from pathlib import Path
+from datetime import datetime
+import os
+import time
+from urllib.parse import quote_plus
+from zoneinfo import ZoneInfo
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+from dotenv import load_dotenv
+import feedparser
+from google import genai
+from nba_api.stats.endpoints import leaguedashteamstats, scoreboardv2
+from nba_api.stats.static import teams
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+load_dotenv()
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
+# Load AI and decide version of AI
+client = genai.Client(api_key=os.environ['GEMINI_API_KEY'])
+MODEL_NAME = 'gemini-2.5-flash'
+
+
+def get_tonights_matchups(game_date_et=None):
     """
+    gets nba matchup for the night given
+    """
+    
+    if game_date_et is None:
+        game_date_et = datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d')
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+    all_teams = teams.get_teams()
+    id_to_team = {t['id']: t for t in all_teams}
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+    board = scoreboardv2.ScoreboardV2(game_date=game_date_et)
+    games_df = board.game_header.get_data_frame()
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
+    matchups = []
+    for _, row in games_df.iterrows():
+        home = id_to_team.get(int(row['HOME_TEAM_ID']))
+        away = id_to_team.get(int(row['VISITOR_TEAM_ID']))
+        if home and away:
+            matchups.append({
+                'game_date': game_date_et,
+                'home_abbr': home['abbreviation'],
+                'home_name': home['full_name'],
+                'away_abbr': away['abbreviation'],
+                'away_name': away['full_name'],
+                'status': row['GAME_STATUS_TEXT'],
+            })
+
+    return matchups
+
+
+def fetch_news_for_playing_teams(playing_abbrs, articles_per_team=5):
+    """
+    feteches news for the playing teams given
+    """
+    
+    abbr_to_team = {t['abbreviation']: t for t in teams.get_teams()}
+    headlines_by_team = {}
+
+    for abbr in sorted(playing_abbrs):
+        team = abbr_to_team.get(abbr)
+        if not team:
+            continue
+
+        query = quote_plus(f'"{team["full_name"]}" NBA')
+        rss_url = f'https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en'
+
+        feed = feedparser.parse(rss_url)
+        entries = getattr(feed, 'entries', [])[:articles_per_team]
+        headlines_by_team[abbr] = [e.get('title', '') for e in entries if e.get('title')]
+        time.sleep(0.3)
+
+    return headlines_by_team
+
+
+def fetch_team_stats():
+    """
+    gets team stats for the playing teams
+    """
+    
+    id_to_abbr = {t['id']: t['abbreviation'] for t in teams.get_teams()}
+    df = leaguedashteamstats.LeagueDashTeamStats(per_mode_detailed='PerGame').get_data_frames()[0]
+
+    stats = {}
+    for _, row in df.iterrows():
+        abbr = id_to_abbr.get(int(row['TEAM_ID']))
+        if abbr:
+            stats[abbr] = {
+                'record': f"{int(row['W'])}-{int(row['L'])}",
+                'win_pct': round(float(row['W_PCT']), 3),
+                'ppg': round(float(row['PTS']), 1),
+                'plus_minus': round(float(row['PLUS_MINUS']), 1),
+            }
+
+    return stats
+
+
+def predict_matchups(matchups, stats, headlines_by_team):
+    """
+    this gets gemini to predict based on given information 
+    """
+    
+    blocks = []
+    for m in matchups:
+        home = m['home_abbr']
+        away = m['away_abbr']
+
+        away_news = '\n'.join(f'  - {h}' for h in headlines_by_team.get(away, [])) or '  - No recent headlines'
+        home_news = '\n'.join(f'  - {h}' for h in headlines_by_team.get(home, [])) or '  - No recent headlines'
+
+        blocks.append(
+            f"Matchup: {away} @ {home} ({m['status']})\n"
+            f'  {away} (Away) stats: {stats.get(away, {})}\n'
+            f'  {away} headlines:\n{away_news}\n'
+            f'  {home} (Home) stats: {stats.get(home, {})}\n'
+            f'  {home} headlines:\n{home_news}'
+        )
+
+    prompt = (
+        'Look at the stats and recent news headlines for each NBA matchup below.\n'
+        'For every team playing:\n'
+        '1. Give a sentiment score from -1.0 (very negative, e.g. key injury or slump) '
+        'to +1.0 (very positive, e.g. winning streak or healthy return).\n'
+        '2. Predict who wins each game, give rough win probabilities, and explain why briefly.\n\n'
+        + '\n\n---\n\n'.join(blocks)
     )
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
-
-    return gdp_df
-
-gdp_df = get_gdp_data()
-
-# -----------------------------------------------------------------------------
-# Draw the actual page
-
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
-
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
-
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=prompt,
+    )
+    return response.text
 
 
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
+if __name__ == '__main__':
+    matchups = get_tonights_matchups()
+    if not matchups:
+        print('No games tonight.')
+        raise SystemExit(0)
 
-st.header(f'GDP in {to_year}', divider='gray')
+    playing_teams = {m['home_abbr'] for m in matchups} | {m['away_abbr'] for m in matchups}
+    print(f"Date: {matchups[0]['game_date']} ET | Games: {len(matchups)}")
+    print(f'Teams playing ({len(playing_teams)}): {sorted(playing_teams)}\n')
 
-''
+    headlines_by_team = fetch_news_for_playing_teams(playing_teams, articles_per_team=5)
+    stats = fetch_team_stats()
 
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+    output = predict_matchups(matchups, stats, headlines_by_team)
+    print(output)
