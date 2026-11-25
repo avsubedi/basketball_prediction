@@ -15,7 +15,7 @@ load_dotenv()
 
 # Load AI and decide version of AI
 client = genai.Client(api_key=os.environ['GEMINI_API_KEY'])
-MODEL_NAME = 'gemini-2.5-flash'
+MODEL_NAME = 'gemini-3.1-flash-lite'
 
 
 def get_tonights_matchups(game_date_et: str | None =None):
@@ -69,7 +69,7 @@ def fetch_news_for_playing_teams(playing_abbrs, articles_per_team=5):
         entries = getattr(feed, 'entries', [])[:articles_per_team]
         headlines_by_team[abbr] = [e.get('title', '') for e in entries if e.get('title')]
         time.sleep(0.5)
-        
+
 
     return headlines_by_team
 
